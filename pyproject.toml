@@ -1,0 +1,17 @@
+[project]
+name = "trailcaml"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.2.0",
+    "pillow>=11.0.0",
+    "polars>=1.17.1",
+    "torch>=2.5.1",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "ipython>=8.30.0",
+]
