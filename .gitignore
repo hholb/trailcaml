@@ -11,3 +11,6 @@ wheels/
 
 # Training data
 data/
+.ipynb_checkpoints/
+lightning_logs/
+*.ckpt

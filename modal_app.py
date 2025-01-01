@@ -1,63 +1,62 @@
 import modal
 import torch
 from pathlib import Path
-from trailcaml import TrailCaML, train_model
+from trailcaml import TrailCaML
 from datasets.trailcamera import TrailCameraDataset, fetch_if_missing
 
 app = modal.App("trailcaml")
-app.image = modal.Image.debian_slim().pip_install("torch", "pillow", "numpy", "polars")
+app.image = modal.Image.debian_slim().pip_install(
+    "torch", "pillow", "numpy", "polars", "lightning", "tensorboard"
+)
 vol = modal.Volume.from_name("trailcaml-data", create_if_missing=True)
 
 
 @app.function(gpu="L4", volumes={"/root/data": vol}, timeout=600)
-def train(reload_from_checkpoint=True, learning_rate: float = 0.01, epochs: int = 10):
+def train(epochs: int):
     import torch
-    MODEL_PATH = Path.home() / "data/model.pt"
+    import lightning as L
+    from torch.utils.data import DataLoader
 
-    try:
-        model = TrailCaML()
-        if reload_from_checkpoint and MODEL_PATH.exists():
-            print("Reloading model from checkpoint...")
-            checkpoint = torch.load(MODEL_PATH)
-            model.load_state_dict(checkpoint['model_state_dict'])
+    torch.set_float32_matmul_precision("medium")
 
-        data_paths = fetch_if_missing()
-        train = TrailCameraDataset(data_paths["train"])
-        test = TrailCameraDataset(data_paths["test"])
+    data_paths = fetch_if_missing()
+    train_data = DataLoader(TrailCameraDataset(data_paths["train"]), batch_size=32)
+    val_data = DataLoader(
+        TrailCameraDataset(data_paths["validation"]), batch_size=32, num_workers=4
+    )
+    model = TrailCaML()
 
-        train_model(model, train, test, epochs=epochs, learning_rate=learning_rate)
+    logger = L.pytorch.loggers.TensorBoardLogger("/root/data/lightning_logs")
+    trainer = L.Trainer(
+        max_epochs=epochs,
+        logger=logger,
+        default_root_dir="/root/data/lightning_logs",
+        log_every_n_steps=32,
+    )
+    trainer.fit(model, train_data)
+    trainer.validate(model, val_data)
 
-        # Serialize the model state
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "model_config": model.config if hasattr(model, "config") else None,
-                "model_class": model.__class__.__name__,
-            },
-            MODEL_PATH,
-        )
+    vol.commit()
 
-        # Return the path where the model was saved
-        return str(MODEL_PATH)
 
-    except Exception as e:
-        import traceback
+@app.function(volumes={"/root/data": vol})
+@modal.web_server(6006)
+def serve_tensor_board():
+    from tensorboard import program
 
-        traceback.print_tb(e.__traceback__)
-        print(f"Error during training: {e}")
-        return None
-    finally:
-        # Ensure volume changes are persisted
-        vol.commit()
+    tb = program.TensorBoard()
+    tb.configure(
+        argv=[None, "--logdir", "/root/data/lightning_logs", "--host", "0.0.0.0"]
+    )
+    url = tb.launch()
+    print(f"TensorBoard started at: {url}")
 
 
 @app.local_entrypoint()
 def main(
-    reload_from_checkpoint: bool = False,
-    learning_rate: float = 0.01,
     epochs: int = 10,
 ):
-    model_path_remote = train.remote(reload_from_checkpoint, learning_rate, epochs)
+    model_path_remote = train.remote(epochs)
 
     if model_path_remote is None:
         print("Training failed")

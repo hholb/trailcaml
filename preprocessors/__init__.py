@@ -5,7 +5,7 @@ import torch
 class ImagePreprocessor:
     def __init__(
         self, 
-        size: tuple[int, int] = (640, 640),
+        size: tuple[int, int] = (64, 64),
     ):
         self.size = size
 
