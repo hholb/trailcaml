@@ -1,103 +1,119 @@
-from io import BytesIO
+import json
 from pathlib import Path
 
-from PIL import Image
-import polars as pl
+import PIL
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import v2
+from torchvision.tv_tensors import Image
 
-from preprocessors import ImagePreprocessor
 
-
-# see: https://huggingface.co/datasets/Francesco/trail-camera
-BASE_URL = "hf://datasets/Francesco/trail-camera/"
-DATASET_LOCATIONS = {
-    'train': 'data/train-00000-of-00001-931b9615f2251ad8.parquet',
-    'validation': 'data/validation-00000-of-00001-ac26c1956c34fa02.parquet',
-    'test': 'data/test-00000-of-00001-11d0ac39410a634d.parquet',
-}
-
-ANIMAL_CLASSES = {
-    "none": 0,
-    "deer": 1,
-    "pig": 2,
-    "coyote": 3,
-}
-
-class TrailCameraDataset(Dataset):
-    """ 
-    url: https://huggingface.co/datasets/Francesco/trail-camera
-    """
+class TrailCameraDataset():
     def __init__(
         self,
-        parquet: str | Path,
-        data_dir: Path = Path("data"),
-        preprocessor: ImagePreprocessor = ImagePreprocessor(),
+        data_dir: Path = Path("data/trailcam-dataset/processed"),
+        size = (64, 64),
     ):
-        self._data_dir = data_dir 
-        self.fetch_if_missing()
+        self.data_dir = data_dir
+        self.size = size
+        annotations_filename = "annotations.json"
+        for split in ["train", "valid", "test"]:
+            annotations_file = data_dir / f"{split}" / f"{annotations_filename}"
+            with open(annotations_file, "r") as f:
+                annotations = json.load(f)
+                setattr(self, f"{split}_annotations", annotations)
 
-        self._data = pl.scan_parquet(parquet)
-        self.preprocessor = preprocessor
-        self.length = self._data.count().collect()['image'][0]
+
+    @property
+    def train(self) -> Dataset:
+        return _TrailCameraDataset("train", self.data_dir, self.train_annotations, self.size)
+
+    @property
+    def valid(self) -> Dataset:
+        return _TrailCameraDataset("valid", self.data_dir, self.valid_annotations, self.size)
+
+    @property
+    def test(self) -> Dataset:
+        return _TrailCameraDataset("test", self.data_dir, self.test_annotations, self.size)
+
+    @property
+    def splits(self) -> tuple[Dataset]:
+        return self.train, self.valid, self.test
+
+    def dataloader_splits(self, batch_size=36, num_workers: int | None = None):
+        return [
+            DataLoader(
+                split,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                pin_memory=True,
+                shuffle=(i == 0)
+            )
+            for i, split in enumerate(self.splits)
+        ]
+
+
+class _TrailCameraDataset(Dataset):
+    def __init__(
+        self,
+        split: str,
+        data_dir: Path,
+        annotations: dict,
+        size: tuple[int, int],
+    ):
+        super().__init__()
+        self.split = split
+        self.data_dir = data_dir
+        self.annotations = annotations
+
+        self.base_transforms = v2.Compose([
+            v2.Resize(size, antialias=True),
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+        ])
+
+        self.augmentations = v2.Compose([
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomRotation(10),
+            v2.RandomAutocontrast(p=0.2),
+        ]) if split == "train" else None
 
 
     def __len__(self):
-        return self.length
-
-    def _get_row(self, index):
-        return self._data.slice(index, 1).collect().row(0)
+        return len(self.annotations['images'])
 
     def __getitem__(self, index):
-        row = self._get_row(index)
-        label = self._label_from_row(row)
-        image = self._image_from_row(row)
-        image = self.preprocessor(image)
+        img_meta = self.annotations['images'][index]
+        image = self._load_image(img_meta)
+        label = torch.tensor(self._get_label_for_img(img_meta['id']))
+
+        image = self.base_transforms(image)
+        if self.augmentations is not None:
+            image = self.augmentations(image)
+
         return  image, label
 
-    def _label_from_row(self, row: pl.DataFrame) -> list[int]:
-        labels = row[4]['category']
-        # label structure = [no animal, deer, pig, coyote]
-        labels = [
-            1.0 if not any(labels) else 0.0,
-            1.0 if ANIMAL_CLASSES['deer'] in labels else 0.0,
-            1.0 if ANIMAL_CLASSES['pig'] in labels else 0.0,
-            1.0 if ANIMAL_CLASSES['coyote'] in labels else 0.0,
+    def _load_image(self, img_meta: dict) -> Image:
+        image_file = self.data_dir / f"{self.split}" / f"{img_meta['file_name']}"
+        pil_img = PIL.Image.open(Path(image_file))
+        return Image(pil_img)
+
+    def _get_label_for_img(self, id: int) -> list[float]:
+        antns = [
+            an for an in self.annotations['annotations'] if an['image_id'] == id
         ]
-        return torch.tensor(labels)
+        animals = set(a['category_id'] for a in antns)
+        categories = [
+            c['id'] for c in self.annotations['categories']
+        ]
 
-    def _image_from_row(self, row: pl.DataFrame) -> Image:
-        image_bytes = row[1]['bytes']
-        image = Image.open(BytesIO(image_bytes))
-        return image
+        labels = [
+            1.0 if c in animals else 0.0 for c in categories
+        ]
 
+        # say there is no animal if none of the other labels are present
+        if not any(labels[1:]):
+            labels[0] = 1.0
 
-    def fetch_if_missing(
-        self,
-    ) -> dict[str, Path]:
-        data_dir = self._data_dir
-        if not data_dir.exists():
-            data_dir.mkdir()
+        return labels
 
-        parquet_paths = {}
-        for key, value in DATASET_LOCATIONS.items():
-            f = Path(value)
-            if not f.exists():
-                # download the parquet from hugging face if we don't have it locally
-                print("Fetching data from hugging face...")
-                df = pl.read_parquet(BASE_URL + value)
-                df.write_parquet(f)
-            parquet_paths[key] = f
-
-        return parquet_paths
-
-
-def _DEFAULT_SPLITS():
-    train = TrailCameraDataset(DATASET_LOCATIONS['train']) 
-    valid = TrailCameraDataset(DATASET_LOCATIONS['validation'])
-    test = TrailCameraDataset(DATASET_LOCATIONS['test'])
-    return train, valid, test
-
-
-def DEFAULT_LOADERS(batch_size: int = 32):
-    return tuple(map(lambda ds: DataLoader(ds, batch_size=batch_size), _DEFAULT_SPLITS()))
