@@ -12,22 +12,37 @@ app.image = modal.Image.debian_slim().pip_install(
 vol = modal.Volume.from_name("trailcaml-data", create_if_missing=True)
 
 
-@app.function(cpu=8.0, gpu="L4", volumes={"/app": vol}, timeout=300 * 6)
-def train(epochs: int):
+@app.function(
+    cpu=8.0,
+    gpu="L4",
+    memory=(1024 * 8),
+    timeout=(300 * 6),
+    volumes={"/app": vol},
+)
+def train(
+    epochs: int,
+    lr: float,
+    fine_tune_after: int,
+    lr_reduction: float,
+    batch_size: int,
+    num_workers: int,
+):
     import torch
     import lightning as L
     from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+    from lightning.pytorch.loggers import TensorBoardLogger
 
     torch.set_float32_matmul_precision("medium")
 
     data_set = TrailCameraDataset(data_dir=Path("/app/data/trailcam-dataset/"))
-    train, valid, test = data_set.dataloader_splits(batch_size=32, num_workers=8)
+    train, valid, _ = data_set.dataloader_splits(
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
 
-    logger = L.pytorch.loggers.TensorBoardLogger(save_dir="/app/lightning_logs")
     trainer = L.Trainer(
         max_epochs=epochs,
-        logger=logger,
-        log_every_n_steps=6,
+        logger=TensorBoardLogger(save_dir="/app/lightning_logs"),
         callbacks=[
             # Save best models
             ModelCheckpoint(
@@ -43,12 +58,17 @@ def train(epochs: int):
         deterministic=True,
     )
 
-    model = TrailCaML(lr=1e-3, fine_tune_after=5, img_size=(240, 240))
+    model = TrailCaML(
+        lr=lr,
+        fine_tune_after=fine_tune_after,
+        lr_reduction=lr_reduction,
+        img_size=(240, 240),
+    )
     trainer.fit(model, train_dataloaders=train, val_dataloaders=valid)
     vol.commit()
 
 
-@app.function(volumes={"/app": vol})
+@app.function(volumes={"/app": vol}, timeout=300 * 6)
 @modal.web_server(6006)
 def serve_tensor_board():
     from tensorboard import program
@@ -61,7 +81,6 @@ def serve_tensor_board():
 
 def upload_dataset_to_modal(
     vol: modal.Volume,
-    mnt_dir: Path = Path("/app"),
     dataset_dir: Path = Path("data/trailcam-dataset"),
     remote_dir: Path = Path("data/trailcam-dataset"),
     batch_size: int = 12,
@@ -91,14 +110,14 @@ def upload_dataset_to_modal(
             print(f"Remote directory not found, assuming empty: {e}")
             remote_images = set()
 
-        print(f"Total Local images: {len(local_images)}")
-        print(f"Total remote images: {len(remote_images)}")
+        print(f"Total Local images in split: {len(local_images)}")
+        print(f"Total remote images in split: {len(remote_images)}")
         print(list(local_images)[:5], list(remote_images)[:5])
         images_to_upload = local_images - remote_images
-        print(f"Total files to upload: {len(images_to_upload)}")
+        print(f"Total files to upload for split: {len(images_to_upload)}")
 
         for i, batch in enumerate(chunk(list(images_to_upload), batch_size)):
-            print(f"Uploading Batch: {i}...")
+            print(f"Uploading Batch {i}, {i} of {len(images_to_upload) / batch_size}")
             with vol.batch_upload() as uploader:
                 for img in batch:
                     uploader.put_file(
@@ -112,10 +131,20 @@ def main(
     upload_data: bool = False,
     train_model: bool = False,
     epochs: int = 10,
+    train_batch_size: int = 32,
+    lr: float = 1e-4,
+    lr_reduction: float = 1e2,
     upload_batch_size: int = 12,
+    fine_tune_after: int = 5,
 ):
     if upload_data:
         upload_dataset_to_modal(vol=vol, batch_size=upload_batch_size)
         print("Upload complete.")
     if train_model:
-        train.remote(epochs)
+        train.remote(
+            epochs=epochs,
+            lr=lr,
+            lr_reduction=lr_reduction,
+            batch_size=train_batch_size,
+            fine_tune_after=fine_tune_after,
+        )
