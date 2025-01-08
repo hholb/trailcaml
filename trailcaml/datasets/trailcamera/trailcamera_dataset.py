@@ -7,11 +7,13 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2
 from torchvision.tv_tensors import Image
 
+from config import settings
+
 
 class TrailCameraDataset:
     def __init__(
         self,
-        data_dir: Path = Path("data/trailcam-dataset"),
+        data_dir: Path = Path(settings.dataset_dir),
         size=(64, 64),
     ):
         self.data_dir = data_dir / "processed"

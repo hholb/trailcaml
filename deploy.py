@@ -3,12 +3,10 @@ from pathlib import Path
 import modal
 
 from trailcaml import TrailCaML
-from datasets.trailcamera import TrailCameraDataset
+from trailcaml.datasets.trailcamera import TrailCameraDataset
 
 app = modal.App("trailcaml")
-app.image = modal.Image.debian_slim().pip_install(
-    "torch", "torchvision", "pillow", "numpy", "lightning", "tensorboard"
-)
+app.image = modal.Image.debian_slim().pip_install_from_pyproject("pyproject.toml")
 vol = modal.Volume.from_name("trailcaml-data", create_if_missing=True)
 
 
@@ -136,6 +134,7 @@ def main(
     lr_reduction: float = 1e2,
     upload_batch_size: int = 12,
     fine_tune_after: int = 5,
+    num_workers: int = 8,
 ):
     if upload_data:
         upload_dataset_to_modal(vol=vol, batch_size=upload_batch_size)
@@ -147,4 +146,5 @@ def main(
             lr_reduction=lr_reduction,
             batch_size=train_batch_size,
             fine_tune_after=fine_tune_after,
+            num_workers=num_workers,
         )

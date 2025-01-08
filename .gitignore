@@ -14,3 +14,6 @@ data/
 .ipynb_checkpoints/
 lightning_logs/
 *.ckpt
+
+# Ignore dynaconf secret files
+.secrets.*
